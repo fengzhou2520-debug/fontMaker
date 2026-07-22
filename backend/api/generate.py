@@ -8,6 +8,8 @@ from flask import Blueprint, request, jsonify, current_app
 from threading import Thread
 import logging
 from datetime import datetime
+from backend.models.deepvecfont_v2 import get_model, generate_fonts_task
+from backend.utils.image_processor import preprocess_font_sample, validate_image, validate_font
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,17 @@ def generate_fonts():
         if not file_exists:
             return jsonify({'error': f'File for task {task_id} not found'}), 404
         
+        # Validate input file
+        file_ext = os.path.splitext(input_file)[1].lower()
+        if file_ext in ['.ttf', '.otf']:
+            if not validate_font(input_file):
+                return jsonify({'error': 'Invalid font file'}), 400
+        elif file_ext in ['.png', '.jpg', '.jpeg', '.bmp', '.gif']:
+            if not validate_image(input_file):
+                return jsonify({'error': 'Invalid image file'}), 400
+        else:
+            return jsonify({'error': 'Unsupported file type'}), 400
+        
         # Create generation task
         generation_id = task_id  # Use same ID for tracking
         generation_tasks[generation_id] = {
@@ -76,7 +89,7 @@ def generate_fonts():
         # Start generation in background thread
         thread = Thread(
             target=_process_generation,
-            args=(generation_id, input_file, language, n_samples, reference_char_ids)
+            args=(generation_id, input_file, language, n_samples, reference_char_ids, current_app.config['RESULTS_FOLDER'])
         )
         thread.daemon = True
         thread.start()
@@ -90,7 +103,7 @@ def generate_fonts():
             'language': language,
             'status': 'processing',
             'n_samples': n_samples,
-            'estimated_time_seconds': 120,
+            'estimated_time_seconds': 300,
             'check_status_url': f'/api/generate/status/{generation_id}'
         }), 202
     
@@ -99,49 +112,141 @@ def generate_fonts():
         return jsonify({'error': f'Generation failed: {str(e)}'}), 500
 
 
-def _process_generation(generation_id, input_file, language, n_samples, reference_char_ids):
+def _process_generation(generation_id, input_file, language, n_samples, reference_char_ids, results_folder):
     """
-    Background process for font generation.
-    This is a stub that simulates the DeepVecFont-v2 pipeline.
+    Background process for font generation using DeepVecFont-v2.
+    
+    Pipeline:
+    1. Load and preprocess input (TTF/image)
+    2. Load DeepVecFont-v2 model for target language
+    3. Download model checkpoint if needed
+    4. Run inference to generate font candidates
+    5. Select best using IOU metric
+    6. Render SVG outputs
+    7. Save results
     """
     try:
         task = generation_tasks[generation_id]
         task['status'] = 'processing'
+        task['progress'] = 5
+        
+        logger.info(f"[{generation_id}] Starting font generation pipeline...")
+        
+        # Step 1: Preprocess input
+        logger.info(f"[{generation_id}] Preprocessing input file...")
         task['progress'] = 10
         
-        # TODO: Integrate actual DeepVecFont-v2 model
-        # 1. Load input file (TTF or image)
-        # 2. Preprocess based on language
-        # 3. Run model inference
-        # 4. Generate multiple candidates
-        # 5. Select best using IOU
+        try:
+            input_data = preprocess_font_sample(input_file, language)
+            if input_data is None:
+                raise ValueError("Failed to preprocess input file")
+        except Exception as e:
+            logger.error(f"[{generation_id}] Preprocessing error: {e}")
+            task['status'] = 'failed'
+            task['error'] = f'Preprocessing error: {str(e)}'
+            return
         
-        results_folder = os.path.join(current_app.config['RESULTS_FOLDER'], 'fonts', generation_id)
-        os.makedirs(results_folder, exist_ok=True)
+        task['progress'] = 20
         
-        # Simulate progress
+        # Step 2: Initialize and load model
+        logger.info(f"[{generation_id}] Loading DeepVecFont-v2 model for {language}...")
+        task['progress'] = 30
+        
+        try:
+            model = get_model()
+            if not model.load_checkpoint(language):
+                raise ValueError(f"Failed to load model checkpoint for {language}")
+        except Exception as e:
+            logger.error(f"[{generation_id}] Model loading error: {e}")
+            task['status'] = 'failed'
+            task['error'] = f'Model loading error: {str(e)}'
+            return
+        
+        task['progress'] = 40
+        
+        # Step 3: Generate fonts
+        logger.info(f"[{generation_id}] Generating {n_samples} font candidates...")
         task['progress'] = 50
+        
+        try:
+            generation_results = generate_fonts_task(
+                input_data,
+                language=language,
+                n_samples=n_samples,
+                reference_chars=reference_char_ids if reference_char_ids else None
+            )
+            
+            if generation_results is None:
+                raise ValueError("Font generation failed")
+        except Exception as e:
+            logger.error(f"[{generation_id}] Generation error: {e}")
+            task['status'] = 'failed'
+            task['error'] = f'Generation error: {str(e)}'
+            return
+        
+        task['progress'] = 80
+        
+        # Step 4: Save results
+        logger.info(f"[{generation_id}] Saving results...")
+        task['progress'] = 85
+        
+        try:
+            results_output_dir = os.path.join(results_folder, 'fonts', generation_id)
+            os.makedirs(results_output_dir, exist_ok=True)
+            
+            # Save SVG outputs
+            svg_files = model.save_svg_output(
+                generation_results['svg_outputs'],
+                results_output_dir,
+                language
+            )
+            
+            # Save metadata
+            metadata = {
+                'generation_id': generation_id,
+                'language': language,
+                'n_samples': n_samples,
+                'svg_files': svg_files,
+                'candidates': generation_results.get('candidates', {}),
+                'metadata': generation_results.get('metadata', {}),
+                'generated_at': datetime.now().isoformat()
+            }
+            
+            metadata_path = os.path.join(results_output_dir, 'metadata.json')
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            logger.info(f"[{generation_id}] Saved {len(svg_files)} SVG files and metadata")
+        
+        except Exception as e:
+            logger.error(f"[{generation_id}] Error saving results: {e}")
+            task['status'] = 'failed'
+            task['error'] = f'Error saving results: {str(e)}'
+            return
+        
         task['progress'] = 90
         
-        # Store results metadata
+        # Step 5: Store final results
         task['results'] = {
             'generation_id': generation_id,
             'language': language,
-            'n_samples': n_samples,
-            'output_folder': results_folder,
-            'files': []
+            'n_samples': len(svg_files),
+            'output_folder': results_output_dir,
+            'files': svg_files,
+            'metadata_file': metadata_path,
+            'preview_url': f'/api/results/{generation_id}'
         }
         
         task['status'] = 'completed'
         task['progress'] = 100
         task['completed_at'] = datetime.now().isoformat()
         
-        logger.info(f"Generation completed: {generation_id}")
+        logger.info(f"[{generation_id}] ✓ Font generation completed successfully!")
     
     except Exception as e:
-        logger.error(f"Generation processing error: {str(e)}")
-        generation_tasks[generation_id]['status'] = 'failed'
-        generation_tasks[generation_id]['error'] = str(e)
+        logger.error(f"[{generation_id}] Unexpected error: {str(e)}")
+        task['status'] = 'failed'
+        task['error'] = f'Unexpected error: {str(e)}'
 
 
 @generate_bp.route('/generate/status/<generation_id>', methods=['GET'])
@@ -190,7 +295,8 @@ def list_generations():
                 'status': task['status'],
                 'language': task['language'],
                 'created_at': task['created_at'],
-                'progress': task['progress']
+                'progress': task['progress'],
+                'n_samples': task.get('results', {}).get('n_samples', 0)
             })
         
         return jsonify({
@@ -200,4 +306,34 @@ def list_generations():
     
     except Exception as e:
         logger.error(f"List error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@generate_bp.route('/generate/cancel/<generation_id>', methods=['POST'])
+def cancel_generation(generation_id):
+    """
+    Cancel an ongoing generation task.
+    """
+    try:
+        if generation_id not in generation_tasks:
+            return jsonify({'error': f'Generation task {generation_id} not found'}), 404
+        
+        task = generation_tasks[generation_id]
+        
+        if task['status'] in ['completed', 'failed', 'cancelled']:
+            return jsonify({'error': f'Cannot cancel task with status: {task["status"]}'}), 400
+        
+        task['status'] = 'cancelled'
+        task['error'] = 'Cancelled by user'
+        
+        logger.info(f"Generation task cancelled: {generation_id}")
+        
+        return jsonify({
+            'success': True,
+            'generation_id': generation_id,
+            'status': 'cancelled'
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Cancellation error: {str(e)}")
         return jsonify({'error': str(e)}), 500
