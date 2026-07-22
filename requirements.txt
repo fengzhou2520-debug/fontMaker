@@ -1,0 +1,32 @@
+# Core dependencies
+Flask==2.3.0
+Flask-CORS==4.0.0
+flask-restx==0.5.1
+
+# PyTorch and ML
+torch==1.13.1
+torchvision==0.14.1
+tensorboardX==2.6.2
+einops==0.7.0
+timm==0.9.7
+
+# Image and Font Processing
+Pillow==10.0.0
+scikit-image==0.21.0
+cairosvg==2.7.0
+numpy==1.24.3
+scipy==1.11.2
+
+# SVG and Vector Processing
+svglib==1.5.1
+svgpathtools==1.4.4
+
+# Utility
+python-dotenv==1.0.0
+click==8.1.7
+requests==2.31.0
+tqdm==4.66.1
+pyyaml==6.0.1
+
+# Frontend (if using Node.js)
+# Note: Frontend dependencies managed via npm in frontend/ directory
